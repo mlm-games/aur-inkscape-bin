@@ -11,11 +11,6 @@ on:
         required: false
         default: false
         type: boolean
-      increment_pkgrel:
-        description: 'Increment pkgrel (for same version updates)'
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   check-and-update:
@@ -138,13 +133,16 @@ jobs:
       if: steps.check.outputs.update_needed == 'true'
       id: pkgrel
       run: |
-        if [[ "${{ steps.current_pkgrel.outputs.same_version }}" == "true" ]] && [[ "${{ inputs.increment_pkgrel }}" == "true" ]]; then
-          CURRENT=${{ steps.current_pkgrel.outputs.current_pkgrel }}
+        CURRENT="${{ steps.current_pkgrel.outputs.current_pkgrel }}"
+        CURRENT=${CURRENT:-0}
+        
+        if [[ "${{ steps.current_pkgrel.outputs.same_version }}" == "true" ]]; then
           NEW_PKGREL=$((CURRENT + 1))
-          echo "pkgrel=$NEW_PKGREL" >> $GITHUB_OUTPUT
         else
-          echo "pkgrel=1" >> $GITHUB_OUTPUT
+          NEW_PKGREL=1
         fi
+        
+        echo "pkgrel=$NEW_PKGREL" >> $GITHUB_OUTPUT
     
     - name: Create PKGBUILD
       if: steps.check.outputs.update_needed == 'true'
