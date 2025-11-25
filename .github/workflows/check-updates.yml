@@ -1,4 +1,4 @@
-: Check and Update Inkscape
+name: Check and Update Inkscape
 
 on:
   schedule:
