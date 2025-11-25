@@ -1,4 +1,4 @@
-name: Check and Update Inkscape
+: Check and Update Inkscape
 
 on:
   schedule:
@@ -24,96 +24,98 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    - name: Check for latest Inkscape stable version
+    - name: Check for latest Inkscape stable version and AppImage URL
       id: check
       run: |
-        # Get latest stable release from Inkscape GitLab
-        RELEASES_JSON=$(curl -s "https://gitlab.com/api/v4/projects/inkscape%2Finkscape/releases")
+        RELEASE_PAGE=$(curl -sL "https://inkscape.org/release/")
+        LATEST_VERSION=$(echo "$RELEASE_PAGE" | grep -oP 'inkscape-\K[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
         
-        if echo "$RELEASES_JSON" | jq -e 'type == "array"' >/dev/null; then
-          LATEST_RELEASE=$(echo "$RELEASES_JSON" | jq -r '[.[] | select(.tag_name | test("alpha|beta|rc|dev"; "i") | not)] | first | .tag_name // empty')
+        if [[ -z "$LATEST_VERSION" ]]; then
+          echo "Error: Could not determine latest version"
+          exit 1
         fi
         
-        # fallback
-        if [[ -z "$LATEST_RELEASE" ]]; then
-          DOWNLOAD_PAGE=$(curl -s "https://inkscape.org/release/")
-          LATEST_RELEASE=$(echo "$DOWNLOAD_PAGE" | grep -oP 'inkscape-\K[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+        echo "Latest version: $LATEST_VERSION"
+        echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+        
+        APPIMAGE_PAGE=$(curl -sL "https://inkscape.org/release/inkscape-${LATEST_VERSION}/gnulinux/appimage/dl/")
+        
+        APPIMAGE_URL=$(echo "$APPIMAGE_PAGE" | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/[^"]+\.AppImage' | head -1)
+        
+        # If not found, try alternative pattern
+        if [[ -z "$APPIMAGE_URL" ]]; then
+          APPIMAGE_URL=$(echo "$APPIMAGE_PAGE" | grep -oP 'href="(/gallery/item/[0-9]+/[^"]+\.AppImage)"' | head -1 | sed 's/href="/https:\/\/inkscape.org/' | sed 's/"$//')
         fi
         
-        echo "Latest version: $LATEST_RELEASE"
+        # Another fallback: look for redirect or meta refresh
+        if [[ -z "$APPIMAGE_URL" ]]; then
+          # The dl/ page might redirect, follow it
+          REDIRECT_URL=$(curl -sI "https://inkscape.org/release/inkscape-${LATEST_VERSION}/gnulinux/appimage/dl/" | grep -i "location:" | tail -1 | awk '{print $2}' | tr -d '\r')
+          if [[ -n "$REDIRECT_URL" && "$REDIRECT_URL" == *".AppImage"* ]]; then
+            APPIMAGE_URL="$REDIRECT_URL"
+          fi
+        fi
         
-        CLEAN_VERSION=$(echo "$LATEST_RELEASE" | sed 's/INKSCAPE_//g' | sed 's/_/./g')
-        echo "latest_version_raw=$LATEST_RELEASE" >> $GITHUB_OUTPUT
-        echo "latest_version=$CLEAN_VERSION" >> $GITHUB_OUTPUT
+        # Final fallback: search the gallery directly
+        if [[ -z "$APPIMAGE_URL" ]]; then
+          echo "Searching gallery for AppImage..."
+          GALLERY_SEARCH=$(curl -sL "https://inkscape.org/gallery/?q=AppImage+${LATEST_VERSION}")
+          APPIMAGE_URL=$(echo "$GALLERY_SEARCH" | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/Inkscape[^"]*x86_64\.AppImage' | head -1)
+        fi
+        
+        if [[ -z "$APPIMAGE_URL" ]]; then
+          echo "Error: Could not find AppImage download URL"
+          exit 1
+        fi
+        
+        echo "AppImage URL: $APPIMAGE_URL"
+        echo "appimage_url=$APPIMAGE_URL" >> $GITHUB_OUTPUT
         
         # Get current version from AUR PKGBUILD
         CURRENT_VERSION=$(curl -s "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin" | grep "^pkgver=" | cut -d= -f2 || echo "none")
         echo "Current version in AUR: $CURRENT_VERSION"
         echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
         
-        if [[ "$CLEAN_VERSION" != "$CURRENT_VERSION" ]] || [[ "${{ inputs.force_update }}" == "true" ]]; then
+        if [[ "$LATEST_VERSION" != "$CURRENT_VERSION" ]] || [[ "${{ inputs.force_update }}" == "true" ]]; then
           echo "update_needed=true" >> $GITHUB_OUTPUT
         else
           echo "update_needed=false" >> $GITHUB_OUTPUT
         fi
     
-    - name: Find AppImage download URL
+    - name: Download and verify AppImage
       if: steps.check.outputs.update_needed == 'true'
       id: download
       run: |
-        VERSION="${{ steps.check.outputs.latest_version }}"
-        VERSION_RAW="${{ steps.check.outputs.latest_version_raw }}"
+        URL="${{ steps.check.outputs.appimage_url }}"
         
-        # Try multiple URL patterns (initial, remove later)
-        URLS=(
-          "https://inkscape.org/gallery/item/44616/Inkscape-${VERSION}-x86_64.AppImage"
-          "https://inkscape.org/gallery/item/44616/Inkscape-${VERSION_RAW}-x86_64.AppImage"
-          "https://media.inkscape.org/dl/resources/file/Inkscape-${VERSION}-x86_64.AppImage"
-        )
+        echo "Downloading from: $URL"
         
-        RELEASE_INFO=$(curl -s "https://gitlab.com/api/v4/projects/inkscape%2Finkscape/releases/${VERSION_RAW}" 2>/dev/null || echo "{}")
-        GITLAB_URL=$(echo "$RELEASE_INFO" | jq -r '.assets.links[]? | select(.name | test("AppImage"; "i")) | .direct_asset_url // .url' 2>/dev/null | head -1)
+        # Download with proper redirect following
+        wget --max-redirect=10 -O inkscape.AppImage "$URL"
         
-        if [[ -n "$GITLAB_URL" && "$GITLAB_URL" != "null" ]]; then
-          URLS=("$GITLAB_URL" "${URLS[@]}")
-        fi
+        # Verify it's actually an AppImage (check magic bytes)
+        FILE_TYPE=$(file inkscape.AppImage)
+        echo "File type: $FILE_TYPE"
         
-        # Try each URL
-        FOUND_URL=""
-        for URL in "${URLS[@]}"; do
-          echo "Trying: $URL"
-          if curl --head --silent --fail "$URL" >/dev/null 2>&1; then
-            FOUND_URL="$URL"
-            echo "Found valid URL: $FOUND_URL"
-            break
-          fi
-        done
-        
-        # fallback
-        if [[ -z "$FOUND_URL" ]]; then
-          echo "Checking inkscape.org download page..."
-          DOWNLOAD_PAGE=$(curl -s "https://inkscape.org/release/inkscape-${VERSION}/gnulinux/appimage/dl/")
-          FOUND_URL=$(echo "$DOWNLOAD_PAGE" | grep -oP 'https://[^"]+\.AppImage' | head -1)
-        fi
-        
-        if [[ -z "$FOUND_URL" ]]; then
-          echo "Error: Could not find AppImage download URL"
+        if [[ ! "$FILE_TYPE" == *"ELF"* && ! "$FILE_TYPE" == *"executable"* && ! "$FILE_TYPE" == *"AppImage"* ]]; then
+          echo "Error: Downloaded file is not a valid AppImage"
+          echo "File content preview:"
+          head -c 500 inkscape.AppImage
           exit 1
         fi
         
-        echo "url=$FOUND_URL" >> $GITHUB_OUTPUT
-        
-        wget -O inkscape.AppImage "$FOUND_URL"
-        CHECKSUM=$(sha256sum inkscape.AppImage | cut -d ' ' -f 1)
-        echo "sha256sum=$CHECKSUM" >> $GITHUB_OUTPUT
-        
+        # Verify file size (AppImage should be > 50MB)
         SIZE=$(stat -c%s inkscape.AppImage)
         echo "Download size: $SIZE bytes"
         
         if [[ $SIZE -lt 50000000 ]]; then
-          echo "Error: Downloaded file too small (expected ~100MB+), mostly not valid"
+          echo "Error: Downloaded file too small (expected ~100MB+)"
           exit 1
         fi
+        
+        # Calculate checksum
+        CHECKSUM=$(sha256sum inkscape.AppImage | cut -d ' ' -f 1)
+        echo "sha256sum=$CHECKSUM" >> $GITHUB_OUTPUT
         
         rm inkscape.AppImage
     
@@ -167,14 +169,13 @@ jobs:
         provides=('inkscape')
         conflicts=('inkscape')
         options=('!strip')
-        source=("inkscape-${pkgver}.AppImage::${{ steps.download.outputs.url }}"
+        source=("inkscape-${pkgver}.AppImage::${{ steps.check.outputs.appimage_url }}"
                 "inkscape.desktop")
         sha256sums=('${{ steps.download.outputs.sha256sum }}'
                     'SKIP')
         noextract=("inkscape-${pkgver}.AppImage")
         
         prepare() {
-            # to get icon
             chmod +x "inkscape-${pkgver}.AppImage"
             ./inkscape-${pkgver}.AppImage --appimage-extract >/dev/null 2>&1 || true
         }
@@ -182,7 +183,6 @@ jobs:
         package() {
             install -Dm755 "inkscape-${pkgver}.AppImage" "$pkgdir/opt/inkscape/inkscape.AppImage"
             
-            # wrapper
             install -dm755 "$pkgdir/usr/bin"
             cat > "$pkgdir/usr/bin/inkscape" << 'WRAPPER'
         #!/bin/bash
@@ -196,14 +196,9 @@ jobs:
                 cp -r "$srcdir/squashfs-root/usr/share/icons"/* "$pkgdir/usr/share/icons/" 2>/dev/null || true
             fi
             
-            # Fallback icon
             if [[ -f "$srcdir/squashfs-root/org.inkscape.Inkscape.svg" ]]; then
                 install -Dm644 "$srcdir/squashfs-root/org.inkscape.Inkscape.svg" \
                     "$pkgdir/usr/share/icons/hicolor/scalable/apps/org.inkscape.Inkscape.svg"
-            fi
-            
-            if [[ -d "$srcdir/squashfs-root/usr/share/mime" ]]; then
-                cp -r "$srcdir/squashfs-root/usr/share/mime"/* "$pkgdir/usr/share/mime/" 2>/dev/null || true
             fi
         }
         EOF
@@ -218,7 +213,7 @@ jobs:
         Terminal=false
         Type=Application
         Categories=Graphics;VectorGraphics;GTK;
-        MimeType=image/svg+xml;image/svg+xml-compressed;application/vnd.corel-draw;application/pdf;application/postscript;image/x-eps;application/illustrator;image/x-wmf;image/x-emf;application/x-xccx;application/x-xcgm;application/x-xcdt;application/x-xsk1;application/x-xcmx;image/x-xcdr;
+        MimeType=image/svg+xml;image/svg+xml-compressed;application/vnd.corel-draw;application/pdf;application/postscript;image/x-eps;application/illustrator;image/x-wmf;image/x-emf;
         StartupNotify=true
         StartupWMClass=inkscape
         Keywords=vector;graphics;svg;drawing;illustration;
