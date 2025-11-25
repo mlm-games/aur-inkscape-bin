@@ -1,0 +1,238 @@
+name: Check and Update Inkscape
+
+on:
+  schedule:
+    # Run every 2 days at 00:00 UTC
+    - cron: '0 0 */2 * *'
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: 'Force update even if version unchanged'
+        required: false
+        default: false
+        type: boolean
+      increment_pkgrel:
+        description: 'Increment pkgrel (for same version updates)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Check for latest Inkscape stable version
+      id: check
+      run: |
+        # Get latest stable release from Inkscape GitLab
+        RELEASES_JSON=$(curl -s "https://gitlab.com/api/v4/projects/inkscape%2Finkscape/releases")
+        
+        if echo "$RELEASES_JSON" | jq -e 'type == "array"' >/dev/null; then
+          LATEST_RELEASE=$(echo "$RELEASES_JSON" | jq -r '[.[] | select(.tag_name | test("alpha|beta|rc|dev"; "i") | not)] | first | .tag_name // empty')
+        fi
+        
+        # fallback
+        if [[ -z "$LATEST_RELEASE" ]]; then
+          DOWNLOAD_PAGE=$(curl -s "https://inkscape.org/release/")
+          LATEST_RELEASE=$(echo "$DOWNLOAD_PAGE" | grep -oP 'inkscape-\K[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+        fi
+        
+        echo "Latest version: $LATEST_RELEASE"
+        
+        CLEAN_VERSION=$(echo "$LATEST_RELEASE" | sed 's/INKSCAPE_//g' | sed 's/_/./g')
+        echo "latest_version_raw=$LATEST_RELEASE" >> $GITHUB_OUTPUT
+        echo "latest_version=$CLEAN_VERSION" >> $GITHUB_OUTPUT
+        
+        # Get current version from AUR PKGBUILD
+        CURRENT_VERSION=$(curl -s "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin" | grep "^pkgver=" | cut -d= -f2 || echo "none")
+        echo "Current version in AUR: $CURRENT_VERSION"
+        echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+        
+        if [[ "$CLEAN_VERSION" != "$CURRENT_VERSION" ]] || [[ "${{ inputs.force_update }}" == "true" ]]; then
+          echo "update_needed=true" >> $GITHUB_OUTPUT
+        else
+          echo "update_needed=false" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Find AppImage download URL
+      if: steps.check.outputs.update_needed == 'true'
+      id: download
+      run: |
+        VERSION="${{ steps.check.outputs.latest_version }}"
+        VERSION_RAW="${{ steps.check.outputs.latest_version_raw }}"
+        
+        # Try multiple URL patterns (initial, remove later)
+        URLS=(
+          "https://inkscape.org/gallery/item/44616/Inkscape-${VERSION}-x86_64.AppImage"
+          "https://inkscape.org/gallery/item/44616/Inkscape-${VERSION_RAW}-x86_64.AppImage"
+          "https://media.inkscape.org/dl/resources/file/Inkscape-${VERSION}-x86_64.AppImage"
+        )
+        
+        RELEASE_INFO=$(curl -s "https://gitlab.com/api/v4/projects/inkscape%2Finkscape/releases/${VERSION_RAW}" 2>/dev/null || echo "{}")
+        GITLAB_URL=$(echo "$RELEASE_INFO" | jq -r '.assets.links[]? | select(.name | test("AppImage"; "i")) | .direct_asset_url // .url' 2>/dev/null | head -1)
+        
+        if [[ -n "$GITLAB_URL" && "$GITLAB_URL" != "null" ]]; then
+          URLS=("$GITLAB_URL" "${URLS[@]}")
+        fi
+        
+        # Try each URL
+        FOUND_URL=""
+        for URL in "${URLS[@]}"; do
+          echo "Trying: $URL"
+          if curl --head --silent --fail "$URL" >/dev/null 2>&1; then
+            FOUND_URL="$URL"
+            echo "Found valid URL: $FOUND_URL"
+            break
+          fi
+        done
+        
+        # fallback
+        if [[ -z "$FOUND_URL" ]]; then
+          echo "Checking inkscape.org download page..."
+          DOWNLOAD_PAGE=$(curl -s "https://inkscape.org/release/inkscape-${VERSION}/gnulinux/appimage/dl/")
+          FOUND_URL=$(echo "$DOWNLOAD_PAGE" | grep -oP 'https://[^"]+\.AppImage' | head -1)
+        fi
+        
+        if [[ -z "$FOUND_URL" ]]; then
+          echo "Error: Could not find AppImage download URL"
+          exit 1
+        fi
+        
+        echo "url=$FOUND_URL" >> $GITHUB_OUTPUT
+        
+        wget -O inkscape.AppImage "$FOUND_URL"
+        CHECKSUM=$(sha256sum inkscape.AppImage | cut -d ' ' -f 1)
+        echo "sha256sum=$CHECKSUM" >> $GITHUB_OUTPUT
+        
+        SIZE=$(stat -c%s inkscape.AppImage)
+        echo "Download size: $SIZE bytes"
+        
+        if [[ $SIZE -lt 50000000 ]]; then
+          echo "Error: Downloaded file too small (expected ~100MB+), mostly not valid"
+          exit 1
+        fi
+        
+        rm inkscape.AppImage
+    
+    - name: Get current pkgrel from AUR
+      if: steps.check.outputs.update_needed == 'true'
+      id: current_pkgrel
+      run: |
+        CURRENT_PKGREL=$(curl -s "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin" | grep "^pkgrel=" | cut -d= -f2 || echo "0")
+        echo "current_pkgrel=$CURRENT_PKGREL" >> $GITHUB_OUTPUT
+        
+        AUR_VERSION=$(curl -s "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin" | grep "^pkgver=" | cut -d= -f2 || echo "none")
+        if [[ "$AUR_VERSION" == "${{ steps.check.outputs.latest_version }}" ]]; then
+          echo "same_version=true" >> $GITHUB_OUTPUT
+        else
+          echo "same_version=false" >> $GITHUB_OUTPUT
+        fi
+      continue-on-error: true
+    
+    - name: Determine pkgrel
+      if: steps.check.outputs.update_needed == 'true'
+      id: pkgrel
+      run: |
+        if [[ "${{ steps.current_pkgrel.outputs.same_version }}" == "true" ]] && [[ "${{ inputs.increment_pkgrel }}" == "true" ]]; then
+          CURRENT=${{ steps.current_pkgrel.outputs.current_pkgrel }}
+          NEW_PKGREL=$((CURRENT + 1))
+          echo "pkgrel=$NEW_PKGREL" >> $GITHUB_OUTPUT
+        else
+          echo "pkgrel=1" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Create PKGBUILD
+      if: steps.check.outputs.update_needed == 'true'
+      run: |
+        mkdir -p aur-package
+        cat > aur-package/PKGBUILD << 'EOF'
+        # Maintainer: MLM-stuff gfxoxinzh@mozmail.com
+        pkgname=inkscape-bin
+        pkgver=${{ steps.check.outputs.latest_version }}
+        pkgrel=${{ steps.pkgrel.outputs.pkgrel }}
+        pkgdesc="Professional vector graphics editor - Prebuilt AppImage"
+        arch=('x86_64')
+        url="https://inkscape.org"
+        license=('GPL-2.0-or-later')
+        depends=('fuse2' 'hicolor-icon-theme')
+        optdepends=('python: for extensions'
+                    'python-numpy: for some extensions'
+                    'python-lxml: for some extensions'
+                    'fig2dev: xfig import'
+                    'gvfs: file system support'
+                    'pstoedit: PostScript support')
+        provides=('inkscape')
+        conflicts=('inkscape')
+        options=('!strip')
+        source=("inkscape-${pkgver}.AppImage::${{ steps.download.outputs.url }}"
+                "inkscape.desktop")
+        sha256sums=('${{ steps.download.outputs.sha256sum }}'
+                    'SKIP')
+        noextract=("inkscape-${pkgver}.AppImage")
+        
+        prepare() {
+            # to get icon
+            chmod +x "inkscape-${pkgver}.AppImage"
+            ./inkscape-${pkgver}.AppImage --appimage-extract >/dev/null 2>&1 || true
+        }
+        
+        package() {
+            install -Dm755 "inkscape-${pkgver}.AppImage" "$pkgdir/opt/inkscape/inkscape.AppImage"
+            
+            # wrapper
+            install -dm755 "$pkgdir/usr/bin"
+            cat > "$pkgdir/usr/bin/inkscape" << 'WRAPPER'
+        #!/bin/bash
+        exec /opt/inkscape/inkscape.AppImage "$@"
+        WRAPPER
+            chmod 755 "$pkgdir/usr/bin/inkscape"
+            
+            install -Dm644 "$srcdir/inkscape.desktop" "$pkgdir/usr/share/applications/org.inkscape.Inkscape.desktop"
+            
+            if [[ -d "$srcdir/squashfs-root/usr/share/icons" ]]; then
+                cp -r "$srcdir/squashfs-root/usr/share/icons"/* "$pkgdir/usr/share/icons/" 2>/dev/null || true
+            fi
+            
+            # Fallback icon
+            if [[ -f "$srcdir/squashfs-root/org.inkscape.Inkscape.svg" ]]; then
+                install -Dm644 "$srcdir/squashfs-root/org.inkscape.Inkscape.svg" \
+                    "$pkgdir/usr/share/icons/hicolor/scalable/apps/org.inkscape.Inkscape.svg"
+            fi
+            
+            if [[ -d "$srcdir/squashfs-root/usr/share/mime" ]]; then
+                cp -r "$srcdir/squashfs-root/usr/share/mime"/* "$pkgdir/usr/share/mime/" 2>/dev/null || true
+            fi
+        }
+        EOF
+        
+        cat > aur-package/inkscape.desktop << 'EOF'
+        [Desktop Entry]
+        Name=Inkscape
+        Comment=Create and edit Scalable Vector Graphics images
+        GenericName=Vector Graphics Editor
+        Exec=inkscape %F
+        Icon=org.inkscape.Inkscape
+        Terminal=false
+        Type=Application
+        Categories=Graphics;VectorGraphics;GTK;
+        MimeType=image/svg+xml;image/svg+xml-compressed;application/vnd.corel-draw;application/pdf;application/postscript;image/x-eps;application/illustrator;image/x-wmf;image/x-emf;application/x-xccx;application/x-xcgm;application/x-xcdt;application/x-xsk1;application/x-xcmx;image/x-xcdr;
+        StartupNotify=true
+        StartupWMClass=inkscape
+        Keywords=vector;graphics;svg;drawing;illustration;
+        EOF
+    
+    - name: Publish to AUR
+      if: steps.check.outputs.update_needed == 'true'
+      uses: mlm-games/aur-deploy-action@master
+      with:
+        pkgname: inkscape-bin
+        pkgbuild: aur-package/PKGBUILD
+        assets: |
+          aur-package/inkscape.desktop
+        commit_username: MLM-stuff
+        commit_email: gfxoxinzh@mozmail.com
+        ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        commit_message: "Update to version ${{ steps.check.outputs.latest_version }}-${{ steps.pkgrel.outputs.pkgrel }}"
