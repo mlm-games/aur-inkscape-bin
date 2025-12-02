@@ -22,138 +22,65 @@ jobs:
     - name: Check for latest Inkscape stable version and AppImage URL
       id: check
       run: |
-        set -euo pipefail
-        
         RELEASE_PAGE=$(curl -sL "https://inkscape.org/release/")
-        LATEST_VERSION=$(echo "$RELEASE_PAGE" | grep -oE 'inkscape-[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 | sed 's/inkscape-//')
-
+        LATEST_VERSION=$(echo "$RELEASE_PAGE" | grep -oP 'inkscape-\K[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+        
         if [[ -z "$LATEST_VERSION" ]]; then
           echo "Error: Could not determine latest version"
           exit 1
         fi
-
-        echo "Latest version: $LATEST_VERSION"
-        echo "latest_version=$LATEST_VERSION" >> "$GITHUB_OUTPUT"
-
-        # Method 1: Follow the download redirect directly
-        echo "Trying direct download redirect..."
-        APPIMAGE_URL=$(curl -sIL "https://inkscape.org/release/inkscape-${LATEST_VERSION}/gnulinux/appimage/dl/" \
-          | grep -iE '^location:' \
-          | tail -1 \
-          | awk '{print $2}' \
-          | tr -d '\r\n' || true)
         
-        echo "Method 1 result: $APPIMAGE_URL"
-
-        # Method 2: Parse the download page for gallery link
-        if [[ -z "$APPIMAGE_URL" || "$APPIMAGE_URL" != *".AppImage"* ]]; then
-          echo "Trying download page parsing..."
-          APPIMAGE_PAGE=$(curl -sL "https://inkscape.org/release/inkscape-${LATEST_VERSION}/gnulinux/appimage/dl/")
-          
-          # Debug: show page content
-          echo "=== DEBUG: Page content (first 2000 chars) ==="
-          echo "$APPIMAGE_PAGE" | head -c 2000
-          echo ""
-          echo "=== END DEBUG ==="
-          
-          # Look for gallery item links
-          APPIMAGE_URL=$(echo "$APPIMAGE_PAGE" \
-            | grep -oE '/gallery/item/[0-9]+/[^"'"'"']+\.AppImage' \
-            | head -1 \
-            | sed 's|^|https://inkscape.org|' || true)
-          
-          echo "Method 2 result: $APPIMAGE_URL"
+        echo "Latest version: $LATEST_VERSION"
+        echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+        
+        APPIMAGE_PAGE=$(curl -sL "https://inkscape.org/release/inkscape-${LATEST_VERSION}/gnulinux/appimage/dl/")
+        
+        APPIMAGE_URL=$(echo "$APPIMAGE_PAGE" | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/[^"]+\.AppImage' | head -1)
+        
+        # If not found, try alternative pattern
+        if [[ -z "$APPIMAGE_URL" ]]; then
+          APPIMAGE_URL=$(echo "$APPIMAGE_PAGE" | grep -oP 'href="(/gallery/item/[0-9]+/[^"]+\.AppImage)"' | head -1 | sed 's/href="/https:\/\/inkscape.org/' | sed 's/"$//')
         fi
-
-        # Method 3: Check releases page for direct link
-        if [[ -z "$APPIMAGE_URL" || "$APPIMAGE_URL" != *".AppImage"* ]]; then
-          echo "Trying releases page..."
-          RELEASES_PAGE=$(curl -sL "https://inkscape.org/release/inkscape-${LATEST_VERSION}/gnulinux/appimage/")
-          
-          APPIMAGE_URL=$(echo "$RELEASES_PAGE" \
-            | grep -oE 'href="([^"]*\.AppImage)"' \
-            | head -1 \
-            | sed 's/href="//; s/"$//' || true)
-          
-          if [[ -n "$APPIMAGE_URL" && "$APPIMAGE_URL" != http* ]]; then
-            APPIMAGE_URL="https://inkscape.org${APPIMAGE_URL}"
+        
+        # Another fallback: look for redirect or meta refresh
+        if [[ -z "$APPIMAGE_URL" ]]; then
+          # The dl/ page might redirect, follow it
+          REDIRECT_URL=$(curl -sI "https://inkscape.org/release/inkscape-${LATEST_VERSION}/gnulinux/appimage/dl/" | grep -i "location:" | tail -1 | awk '{print $2}' | tr -d '\r')
+          if [[ -n "$REDIRECT_URL" && "$REDIRECT_URL" == *".AppImage"* ]]; then
+            APPIMAGE_URL="$REDIRECT_URL"
           fi
-          
-          echo "Method 3 result: $APPIMAGE_URL"
         fi
-
-        # Method 4: Use known gallery URL pattern
-        if [[ -z "$APPIMAGE_URL" || "$APPIMAGE_URL" != *".AppImage"* ]]; then
-          echo "Trying gallery search..."
-          # Search the gallery for AppImage
-          GALLERY_PAGE=$(curl -sL "https://inkscape.org/gallery/=extension/AppImage/")
-          
-          APPIMAGE_URL=$(echo "$GALLERY_PAGE" \
-            | grep -oE '/gallery/item/[0-9]+/[^"'"'"']*x86_64\.AppImage' \
-            | head -1 \
-            | sed 's|^|https://inkscape.org|' || true)
-          
-          echo "Method 4 result: $APPIMAGE_URL"
+        
+        # Final fallback: search the gallery directly
+        if [[ -z "$APPIMAGE_URL" ]]; then
+          echo "Searching gallery for AppImage..."
+          GALLERY_SEARCH=$(curl -sL "https://inkscape.org/gallery/?q=AppImage+${LATEST_VERSION}")
+          APPIMAGE_URL=$(echo "$GALLERY_SEARCH" | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/Inkscape[^"]*x86_64\.AppImage' | head -1)
         fi
-
-        # Method 5: Construct URL from known pattern (fallback)
-        if [[ -z "$APPIMAGE_URL" || "$APPIMAGE_URL" != *".AppImage"* ]]; then
-          echo "Trying known URL pattern fallback..."
-          # Try fetching the current AUR source URL as reference
-          AUR_PKGBUILD=$(curl -sL "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin")
-          CURRENT_AUR_URL=$(echo "$AUR_PKGBUILD" \
-            | grep -oE 'https://inkscape\.org/gallery/item/[0-9]+/[^"'"'"')+]+\.AppImage' \
-            | head -1 || true)
-          
-          if [[ -n "$CURRENT_AUR_URL" ]]; then
-            echo "Found URL in current AUR PKGBUILD: $CURRENT_AUR_URL"
-            # Check if this URL still works
-            HTTP_STATUS=$(curl -sI -o /dev/null -w "%{http_code}" "$CURRENT_AUR_URL" || echo "000")
-            if [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "302" ]]; then
-              APPIMAGE_URL="$CURRENT_AUR_URL"
-              echo "Current AUR URL still valid"
-            fi
-          fi
-          
-          echo "Method 5 result: $APPIMAGE_URL"
-        fi
-
-        if [[ -z "$APPIMAGE_URL" || "$APPIMAGE_URL" != *".AppImage"* ]]; then
+        
+        if [[ -z "$APPIMAGE_URL" ]]; then
           echo "Error: Could not find AppImage download URL"
-          echo "All methods failed to find a valid AppImage URL"
           exit 1
         fi
-
-        echo "Final AppImage URL: $APPIMAGE_URL"
-        echo "appimage_url=$APPIMAGE_URL" >> "$GITHUB_OUTPUT"
-
-        # Get current version from AUR
-        AUR_PKG_URL="https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin"
-        PKGBUILD_CONTENT=$(curl -sL "$AUR_PKG_URL")
-
-        CURRENT_VERSION=$(echo "$PKGBUILD_CONTENT" \
-          | grep '^pkgver=' \
-          | head -1 \
-          | cut -d'=' -f2 \
-          | tr -d '"'"'")
-
-        CURRENT_VERSION=${CURRENT_VERSION:-none}
-
+        
+        echo "AppImage URL: $APPIMAGE_URL"
+        echo "appimage_url=$APPIMAGE_URL" >> $GITHUB_OUTPUT
+        
+        # Get current version from AUR PKGBUILD
+        CURRENT_VERSION=$(curl -s "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin" | grep "^pkgver=" | cut -d= -f2 || echo "none")
         echo "Current version in AUR: $CURRENT_VERSION"
-        echo "current_version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
-
+        echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+        
         if [[ "$LATEST_VERSION" != "$CURRENT_VERSION" ]] || [[ "${{ inputs.force_update }}" == "true" ]]; then
-          echo "update_needed=true" >> "$GITHUB_OUTPUT"
+          echo "update_needed=true" >> $GITHUB_OUTPUT
         else
-          echo "update_needed=false" >> "$GITHUB_OUTPUT"
+          echo "update_needed=false" >> $GITHUB_OUTPUT
         fi
     
     - name: Download and verify AppImage
       if: steps.check.outputs.update_needed == 'true'
       id: download
       run: |
-        set -euo pipefail
-        
         URL="${{ steps.check.outputs.appimage_url }}"
         
         echo "Downloading from: $URL"
@@ -183,47 +110,29 @@ jobs:
         
         # Calculate checksum
         CHECKSUM=$(sha256sum inkscape.AppImage | cut -d ' ' -f 1)
-        echo "sha256sum=$CHECKSUM" >> "$GITHUB_OUTPUT"
+        echo "sha256sum=$CHECKSUM" >> $GITHUB_OUTPUT
         
         rm inkscape.AppImage
     
     - name: Get current pkgrel from AUR
       if: steps.check.outputs.update_needed == 'true'
       id: current_pkgrel
-      continue-on-error: true
       run: |
-        set -euo pipefail
+        CURRENT_PKGREL=$(curl -s "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin" | grep "^pkgrel=" | cut -d= -f2 || echo "0")
+        echo "current_pkgrel=$CURRENT_PKGREL" >> $GITHUB_OUTPUT
         
-        AUR_PKG_URL="https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin"
-        PKGBUILD_CONTENT=$(curl -sL "$AUR_PKG_URL")
-
-        CURRENT_PKGREL=$(echo "$PKGBUILD_CONTENT" \
-          | grep '^pkgrel=' \
-          | head -1 \
-          | cut -d'=' -f2 \
-          | tr -d '"'"'")
-        CURRENT_PKGREL=${CURRENT_PKGREL:-1}
-        echo "current_pkgrel=$CURRENT_PKGREL" >> "$GITHUB_OUTPUT"
-
-        AUR_VERSION=$(echo "$PKGBUILD_CONTENT" \
-          | grep '^pkgver=' \
-          | head -1 \
-          | cut -d'=' -f2 \
-          | tr -d '"'"'")
-        AUR_VERSION=${AUR_VERSION:-none}
-
+        AUR_VERSION=$(curl -s "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin" | grep "^pkgver=" | cut -d= -f2 || echo "none")
         if [[ "$AUR_VERSION" == "${{ steps.check.outputs.latest_version }}" ]]; then
-          echo "same_version=true" >> "$GITHUB_OUTPUT"
+          echo "same_version=true" >> $GITHUB_OUTPUT
         else
-          echo "same_version=false" >> "$GITHUB_OUTPUT"
+          echo "same_version=false" >> $GITHUB_OUTPUT
         fi
+      continue-on-error: true
     
     - name: Determine pkgrel
       if: steps.check.outputs.update_needed == 'true'
       id: pkgrel
       run: |
-        set -euo pipefail
-        
         CURRENT="${{ steps.current_pkgrel.outputs.current_pkgrel }}"
         CURRENT=${CURRENT:-0}
         
@@ -233,15 +142,12 @@ jobs:
           NEW_PKGREL=1
         fi
         
-        echo "pkgrel=$NEW_PKGREL" >> "$GITHUB_OUTPUT"
+        echo "pkgrel=$NEW_PKGREL" >> $GITHUB_OUTPUT
     
     - name: Create PKGBUILD
       if: steps.check.outputs.update_needed == 'true'
       run: |
-        set -euo pipefail
-        
         mkdir -p aur-package
-        
         cat > aur-package/PKGBUILD << 'EOF'
         # Maintainer: MLM-stuff gfxoxinzh@mozmail.com
         pkgname=inkscape-bin
@@ -266,12 +172,12 @@ jobs:
         sha256sums=('${{ steps.download.outputs.sha256sum }}'
                     'SKIP')
         noextract=("inkscape-${pkgver}.AppImage")
-
+        
         prepare() {
             chmod +x "inkscape-${pkgver}.AppImage"
             ./inkscape-${pkgver}.AppImage --appimage-extract >/dev/null 2>&1 || true
         }
-
+        
         package() {
             install -Dm755 "inkscape-${pkgver}.AppImage" "$pkgdir/opt/inkscape/inkscape.AppImage"
             
