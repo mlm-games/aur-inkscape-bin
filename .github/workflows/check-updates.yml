@@ -118,14 +118,19 @@ jobs:
       if: steps.check.outputs.update_needed == 'true'
       id: current_pkgrel
       run: |
-        CURRENT_PKGREL=$(curl -s "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin" | grep "^pkgrel=" | cut -d= -f2 || echo "0")
-        echo "current_pkgrel=$CURRENT_PKGREL" >> $GITHUB_OUTPUT
+        AUR_PKGBUILD=$(curl -s "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin")
+
+        CURRENT_PKGREL=$(echo "$AUR_PKGBUILD" | grep -oP 'pkgrel=\K[^\s]+' | head -1)
+        CURRENT_PKGREL=${CURRENT_PKGREL:-0}
+        echo "current_pkgrel=$CURRENT_PKGREL" >> "$GITHUB_OUTPUT"
         
-        AUR_VERSION=$(curl -s "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin" | grep "^pkgver=" | cut -d= -f2 || echo "none")
+        AUR_VERSION=$(echo "$AUR_PKGBUILD" | grep -oP 'pkgver=\K[^\s]+' | head -1)
+        AUR_VERSION=${AUR_VERSION:-none}
+        
         if [[ "$AUR_VERSION" == "${{ steps.check.outputs.latest_version }}" ]]; then
-          echo "same_version=true" >> $GITHUB_OUTPUT
+          echo "same_version=true" >> "$GITHUB_OUTPUT"
         else
-          echo "same_version=false" >> $GITHUB_OUTPUT
+          echo "same_version=false" >> "$GITHUB_OUTPUT"
         fi
       continue-on-error: true
     
