@@ -22,8 +22,10 @@ jobs:
     - name: Check for latest Inkscape stable version and AppImage URL
       id: check
       run: |
+        set -euo pipefail
+        
         RELEASE_PAGE=$(curl -sL "https://inkscape.org/release/")
-        LATEST_VERSION=$(echo "$RELEASE_PAGE" | grep -oP 'inkscape-\K[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+        LATEST_VERSION=$(echo "$RELEASE_PAGE" | grep -oE 'inkscape-[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 | sed 's/inkscape-//')
 
         if [[ -z "$LATEST_VERSION" ]]; then
           echo "Error: Could not determine latest version"
@@ -35,11 +37,11 @@ jobs:
 
         APPIMAGE_PAGE=$(curl -sL "https://inkscape.org/release/inkscape-${LATEST_VERSION}/gnulinux/appimage/dl/")
 
-        APPIMAGE_URL=$(echo "$APPIMAGE_PAGE" | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/[^"]+\.AppImage' | head -1)
+        APPIMAGE_URL=$(echo "$APPIMAGE_PAGE" | grep -oE 'https://inkscape\.org/gallery/item/[0-9]+/[^"]+\.AppImage' | head -1)
 
         if [[ -z "$APPIMAGE_URL" ]]; then
           APPIMAGE_URL=$(echo "$APPIMAGE_PAGE" \
-            | grep -oP 'href="(/gallery/item/[0-9]+/[^"]+\.AppImage)"' \
+            | grep -oE 'href="(/gallery/item/[0-9]+/[^"]+\.AppImage)"' \
             | head -1 \
             | sed 's/href="/https:\/\/inkscape.org/' | sed 's/"$//')
         fi
@@ -56,7 +58,7 @@ jobs:
           echo "Searching gallery for AppImage..."
           GALLERY_SEARCH=$(curl -sL "https://inkscape.org/gallery/?q=AppImage+${LATEST_VERSION}")
           APPIMAGE_URL=$(echo "$GALLERY_SEARCH" \
-            | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/Inkscape[^"]*x86_64\.AppImage' \
+            | grep -oE 'https://inkscape\.org/gallery/item/[0-9]+/Inkscape[^"]*x86_64\.AppImage' \
             | head -1)
         fi
 
@@ -68,12 +70,15 @@ jobs:
         echo "AppImage URL: $APPIMAGE_URL"
         echo "appimage_url=$APPIMAGE_URL" >> "$GITHUB_OUTPUT"
 
+        # Get current version from AUR
         AUR_PKG_URL="https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin"
+        PKGBUILD_CONTENT=$(curl -sL "$AUR_PKG_URL")
 
-        CURRENT_VERSION=$(curl -s "$AUR_PKG_URL" \
-          | grep -E '^[[:space:]]*pkgver=' \
-          | head -n1 \
-          | sed -E 's/^[[:space:]]*pkgver[[:space:]]*=[[:space:]]*//; s/"//g')
+        CURRENT_VERSION=$(echo "$PKGBUILD_CONTENT" \
+          | grep '^pkgver=' \
+          | head -1 \
+          | cut -d'=' -f2 \
+          | tr -d '"'"'")
 
         CURRENT_VERSION=${CURRENT_VERSION:-none}
 
@@ -90,6 +95,8 @@ jobs:
       if: steps.check.outputs.update_needed == 'true'
       id: download
       run: |
+        set -euo pipefail
+        
         URL="${{ steps.check.outputs.appimage_url }}"
         
         echo "Downloading from: $URL"
@@ -119,7 +126,7 @@ jobs:
         
         # Calculate checksum
         CHECKSUM=$(sha256sum inkscape.AppImage | cut -d ' ' -f 1)
-        echo "sha256sum=$CHECKSUM" >> $GITHUB_OUTPUT
+        echo "sha256sum=$CHECKSUM" >> "$GITHUB_OUTPUT"
         
         rm inkscape.AppImage
     
@@ -128,20 +135,24 @@ jobs:
       id: current_pkgrel
       continue-on-error: true
       run: |
+        set -euo pipefail
+        
         AUR_PKG_URL="https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin"
-        PKGBUILD_CONTENT=$(curl -s "$AUR_PKG_URL" || true)
+        PKGBUILD_CONTENT=$(curl -sL "$AUR_PKG_URL")
 
-        CURRENT_PKGREL=$(printf '%s\n' "$PKGBUILD_CONTENT" \
-          | grep -E '^[[:space:]]*pkgrel=' \
-          | head -n1 \
-          | sed -E 's/^[[:space:]]*pkgrel[[:space:]]*=[[:space:]]*//; s/"//g')
-        CURRENT_PKGREL=${CURRENT_PKGREL:-0}
+        CURRENT_PKGREL=$(echo "$PKGBUILD_CONTENT" \
+          | grep '^pkgrel=' \
+          | head -1 \
+          | cut -d'=' -f2 \
+          | tr -d '"'"'")
+        CURRENT_PKGREL=${CURRENT_PKGREL:-1}
         echo "current_pkgrel=$CURRENT_PKGREL" >> "$GITHUB_OUTPUT"
 
-        AUR_VERSION=$(printf '%s\n' "$PKGBUILD_CONTENT" \
-          | grep -E '^[[:space:]]*pkgver=' \
-          | head -n1 \
-          | sed -E 's/^[[:space:]]*pkgver[[:space:]]*=[[:space:]]*//; s/"//g')
+        AUR_VERSION=$(echo "$PKGBUILD_CONTENT" \
+          | grep '^pkgver=' \
+          | head -1 \
+          | cut -d'=' -f2 \
+          | tr -d '"'"'")
         AUR_VERSION=${AUR_VERSION:-none}
 
         if [[ "$AUR_VERSION" == "${{ steps.check.outputs.latest_version }}" ]]; then
@@ -154,6 +165,8 @@ jobs:
       if: steps.check.outputs.update_needed == 'true'
       id: pkgrel
       run: |
+        set -euo pipefail
+        
         CURRENT="${{ steps.current_pkgrel.outputs.current_pkgrel }}"
         CURRENT=${CURRENT:-0}
         
@@ -163,12 +176,15 @@ jobs:
           NEW_PKGREL=1
         fi
         
-        echo "pkgrel=$NEW_PKGREL" >> $GITHUB_OUTPUT
+        echo "pkgrel=$NEW_PKGREL" >> "$GITHUB_OUTPUT"
     
     - name: Create PKGBUILD
       if: steps.check.outputs.update_needed == 'true'
       run: |
+        set -euo pipefail
+        
         mkdir -p aur-package
+        
         cat > aur-package/PKGBUILD << 'EOF'
         # Maintainer: MLM-stuff gfxoxinzh@mozmail.com
         pkgname=inkscape-bin
@@ -193,12 +209,12 @@ jobs:
         sha256sums=('${{ steps.download.outputs.sha256sum }}'
                     'SKIP')
         noextract=("inkscape-${pkgver}.AppImage")
-        
+
         prepare() {
             chmod +x "inkscape-${pkgver}.AppImage"
             ./inkscape-${pkgver}.AppImage --appimage-extract >/dev/null 2>&1 || true
         }
-        
+
         package() {
             install -Dm755 "inkscape-${pkgver}.AppImage" "$pkgdir/opt/inkscape/inkscape.AppImage"
             
