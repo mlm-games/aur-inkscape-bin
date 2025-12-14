@@ -22,6 +22,8 @@ jobs:
     - name: Check for latest Inkscape stable version and AppImage URL
       id: check
       run: |
+        set -euo pipefail
+
         RELEASE_PAGE=$(curl -sL "https://inkscape.org/release/")
         LATEST_VERSION=$(echo "$RELEASE_PAGE" | grep -oP 'inkscape-\K[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
         
@@ -31,7 +33,7 @@ jobs:
         fi
         
         echo "Latest version: $LATEST_VERSION"
-        echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+        echo "latest_version=$LATEST_VERSION" >> "$GITHUB_OUTPUT"
         
         APPIMAGE_PAGE=$(curl -sL "https://inkscape.org/release/inkscape-${LATEST_VERSION}/gnulinux/appimage/dl/")
         
@@ -64,23 +66,34 @@ jobs:
         fi
         
         echo "AppImage URL: $APPIMAGE_URL"
-        echo "appimage_url=$APPIMAGE_URL" >> $GITHUB_OUTPUT
+        echo "appimage_url=$APPIMAGE_URL" >> "$GITHUB_OUTPUT"
         
-        # Get current version from AUR PKGBUILD
-        CURRENT_VERSION=$(curl -s "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin" | grep "^pkgver=" | cut -d= -f2 || echo "none")
+        echo "Getting current version from AUR..."
+        TMPDIR=$(mktemp -d)
+        CURRENT_VERSION="none"
+        if git clone --depth 1 "https://aur.archlinux.org/inkscape-bin.git" "$TMPDIR"; then
+          if [[ -f "$TMPDIR/PKGBUILD" ]]; then
+            CURRENT_VERSION=$(grep '^pkgver=' "$TMPDIR/PKGBUILD" | head -1 | cut -d= -f2 | tr -d "'\" ")
+          fi
+        else
+          echo "Warning: Failed to clone AUR repo; assuming no current version."
+        fi
+        rm -rf "$TMPDIR"
+        
         echo "Current version in AUR: $CURRENT_VERSION"
-        echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+        echo "current_version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
         
         if [[ "$LATEST_VERSION" != "$CURRENT_VERSION" ]] || [[ "${{ inputs.force_update }}" == "true" ]]; then
-          echo "update_needed=true" >> $GITHUB_OUTPUT
+          echo "update_needed=true" >> "$GITHUB_OUTPUT"
         else
-          echo "update_needed=false" >> $GITHUB_OUTPUT
+          echo "update_needed=false" >> "$GITHUB_OUTPUT"
         fi
     
     - name: Download and verify AppImage
       if: steps.check.outputs.update_needed == 'true'
       id: download
       run: |
+        set -euo pipefail
         URL="${{ steps.check.outputs.appimage_url }}"
         
         echo "Downloading from: $URL"
@@ -110,54 +123,20 @@ jobs:
         
         # Calculate checksum
         CHECKSUM=$(sha256sum inkscape.AppImage | cut -d ' ' -f 1)
-        echo "sha256sum=$CHECKSUM" >> $GITHUB_OUTPUT
+        echo "sha256sum=$CHECKSUM" >> "$GITHUB_OUTPUT"
         
         rm inkscape.AppImage
-    
-    - name: Get current pkgrel from AUR
-      if: steps.check.outputs.update_needed == 'true'
-      id: current_pkgrel
-      run: |
-        AUR_PKGBUILD=$(curl -s "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=inkscape-bin")
-
-        CURRENT_PKGREL=$(echo "$AUR_PKGBUILD" | grep -oP 'pkgrel=\K[^\s]+' | head -1)
-        CURRENT_PKGREL=${CURRENT_PKGREL:-0}
-        echo "current_pkgrel=$CURRENT_PKGREL" >> "$GITHUB_OUTPUT"
-        
-        AUR_VERSION=$(echo "$AUR_PKGBUILD" | grep -oP 'pkgver=\K[^\s]+' | head -1)
-        AUR_VERSION=${AUR_VERSION:-none}
-        
-        if [[ "$AUR_VERSION" == "${{ steps.check.outputs.latest_version }}" ]]; then
-          echo "same_version=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "same_version=false" >> "$GITHUB_OUTPUT"
-        fi
-      continue-on-error: true
-    
-    - name: Determine pkgrel
-      if: steps.check.outputs.update_needed == 'true'
-      id: pkgrel
-      run: |
-        CURRENT="${{ steps.current_pkgrel.outputs.current_pkgrel }}"
-        CURRENT=${CURRENT:-0}
-        
-        if [[ "${{ steps.current_pkgrel.outputs.same_version }}" == "true" ]]; then
-          NEW_PKGREL=$((CURRENT + 1))
-        else
-          NEW_PKGREL=1
-        fi
-        
-        echo "pkgrel=$NEW_PKGREL" >> $GITHUB_OUTPUT
     
     - name: Create PKGBUILD
       if: steps.check.outputs.update_needed == 'true'
       run: |
+        set -euo pipefail
         mkdir -p aur-package
         cat > aur-package/PKGBUILD << 'EOF'
         # Maintainer: MLM-stuff gfxoxinzh@mozmail.com
         pkgname=inkscape-bin
         pkgver=${{ steps.check.outputs.latest_version }}
-        pkgrel=${{ steps.pkgrel.outputs.pkgrel }}
+        pkgrel=1
         pkgdesc="Professional vector graphics editor - Prebuilt AppImage"
         arch=('x86_64')
         url="https://inkscape.org"
@@ -231,7 +210,8 @@ jobs:
         pkgbuild: aur-package/PKGBUILD
         assets: |
           aur-package/inkscape.desktop
+        auto_pkgrel: 'true'
         commit_username: MLM-stuff
         commit_email: gfxoxinzh@mozmail.com
         ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-        commit_message: "Update to version ${{ steps.check.outputs.latest_version }}-${{ steps.pkgrel.outputs.pkgrel }}"
+        commit_message: "Update to version ${{ steps.check.outputs.latest_version }}"
