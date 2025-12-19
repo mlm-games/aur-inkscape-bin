@@ -24,56 +24,61 @@ jobs:
       run: |
         set -euo pipefail
 
+        echo "Fetching release page..."
         RELEASE_PAGE=$(curl -sL "https://inkscape.org/release/")
-        LATEST_VERSION=$(echo "$RELEASE_PAGE" | grep -oP 'inkscape-\K[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+        # Use || true to prevent crash if grep fails
+        LATEST_VERSION=$(echo "$RELEASE_PAGE" | grep -oP 'inkscape-\K[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)
         
         if [[ -z "$LATEST_VERSION" ]]; then
           echo "Error: Could not determine latest version"
           exit 1
         fi
         
-        echo "Latest version: $LATEST_VERSION"
+        echo "Latest version detected: $LATEST_VERSION"
         echo "latest_version=$LATEST_VERSION" >> "$GITHUB_OUTPUT"
         
-        APPIMAGE_PAGE=$(curl -sL "https://inkscape.org/release/inkscape-${LATEST_VERSION}/gnulinux/appimage/dl/")
+        # Method A: Search the specific release page (scrapes the download button)
+        echo "Checking release specific page..."
+        DL_PAGE=$(curl -sL "https://inkscape.org/release/inkscape-${LATEST_VERSION}/gnulinux/appimage/dl/")
         
-        APPIMAGE_URL=$(echo "$APPIMAGE_PAGE" | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/[^"]+\.AppImage' | head -1)
+        APPIMAGE_URL=$(echo "$DL_PAGE" | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/[^"]+\.AppImage' | head -1 || true)
         
-        # If not found, try alternative pattern
+        # Method B: Search for hrefs that look like gallery items (common in redirects)
         if [[ -z "$APPIMAGE_URL" ]]; then
-          APPIMAGE_URL=$(echo "$APPIMAGE_PAGE" | grep -oP 'href="(/gallery/item/[0-9]+/[^"]+\.AppImage)"' | head -1 | sed 's/href="/https:\/\/inkscape.org/' | sed 's/"$//')
-        fi
-        
-        # Another fallback: look for redirect or meta refresh
-        if [[ -z "$APPIMAGE_URL" ]]; then
-          # The dl/ page might redirect, follow it
-          REDIRECT_URL=$(curl -sI "https://inkscape.org/release/inkscape-${LATEST_VERSION}/gnulinux/appimage/dl/" | grep -i "location:" | tail -1 | awk '{print $2}' | tr -d '\r')
-          if [[ -n "$REDIRECT_URL" && "$REDIRECT_URL" == *".AppImage"* ]]; then
-            APPIMAGE_URL="$REDIRECT_URL"
+          echo "Method A failed. Trying Method B (href parsing)..."
+          PARTIAL_URL=$(echo "$DL_PAGE" | grep -oP 'href="/gallery/item/[0-9]+/[^"]+\.AppImage"' | head -1 || true)
+          if [[ -n "$PARTIAL_URL" ]]; then
+             APPIMAGE_URL="https://inkscape.org$(echo "$PARTIAL_URL" | sed 's/href="//' | sed 's/"$//')"
           fi
         fi
-        
-        # Final fallback: search the gallery directly
+
+        # Method C: Direct Gallery Search (fallback)
         if [[ -z "$APPIMAGE_URL" ]]; then
-          echo "Searching gallery for AppImage..."
+          echo "Method B failed. Searching Inkscape Gallery directly..."
+          # Query the gallery for "AppImage" and the version number
           GALLERY_SEARCH=$(curl -sL "https://inkscape.org/gallery/?q=AppImage+${LATEST_VERSION}")
-          APPIMAGE_URL=$(echo "$GALLERY_SEARCH" | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/Inkscape[^"]*x86_64\.AppImage' | head -1)
+          
+          # Regex to find the standard AppImage link from gallery results
+          APPIMAGE_URL=$(echo "$GALLERY_SEARCH" | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/Inkscape[^"]*x86_64\.AppImage' | head -1 || true)
         fi
         
+        # Validation
         if [[ -z "$APPIMAGE_URL" ]]; then
-          echo "Error: Could not find AppImage download URL"
+          echo "Error: Could not find AppImage download URL after all attempts."
+          echo "Debug: Failed to find URL for version $LATEST_VERSION"
           exit 1
         fi
         
-        echo "AppImage URL: $APPIMAGE_URL"
+        echo "AppImage URL found: $APPIMAGE_URL"
         echo "appimage_url=$APPIMAGE_URL" >> "$GITHUB_OUTPUT"
         
+        # 3. Check AUR version
         echo "Getting current version from AUR..."
         TMPDIR=$(mktemp -d)
         CURRENT_VERSION="none"
         if git clone --depth 1 "https://aur.archlinux.org/inkscape-bin.git" "$TMPDIR"; then
           if [[ -f "$TMPDIR/PKGBUILD" ]]; then
-            CURRENT_VERSION=$(grep '^pkgver=' "$TMPDIR/PKGBUILD" | head -1 | cut -d= -f2 | tr -d "'\" ")
+            CURRENT_VERSION=$(grep '^pkgver=' "$TMPDIR/PKGBUILD" | head -1 | cut -d= -f2 | tr -d "'\" " || true)
           fi
         else
           echo "Warning: Failed to clone AUR repo; assuming no current version."
@@ -84,8 +89,10 @@ jobs:
         echo "current_version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
         
         if [[ "$LATEST_VERSION" != "$CURRENT_VERSION" ]] || [[ "${{ inputs.force_update }}" == "true" ]]; then
+          echo "Update required."
           echo "update_needed=true" >> "$GITHUB_OUTPUT"
         else
+          echo "No update required."
           echo "update_needed=false" >> "$GITHUB_OUTPUT"
         fi
     
