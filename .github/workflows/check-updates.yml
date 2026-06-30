@@ -24,13 +24,35 @@ jobs:
       run: |
         set -euo pipefail
 
+        fetch_release_page() {
+          curl -sSfL \
+            --retry 5 \
+            --retry-delay 2 \
+            --retry-max-time 60 \
+            --max-time 30 \
+            "https://inkscape.org/release/"
+        }
+        
         echo "Fetching release page..."
-        RELEASE_PAGE=$(curl -sL "https://inkscape.org/release/")
-        # Use || true to prevent crash if grep fails
-        LATEST_VERSION=$(echo "$RELEASE_PAGE" | grep -oP 'inkscape-\K[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)
+        LATEST_VERSION=""
+        RELEASE_PAGE=""
+        
+        for i in {1..3}; do
+          RELEASE_PAGE="$(fetch_release_page)" || true
+          LATEST_VERSION="$(grep -oP 'inkscape-\K[0-9]+\.[0-9]+(\.[0-9]+)?' <<<"$RELEASE_PAGE" | head -1 || true)"
+        
+          if [[ -n "$LATEST_VERSION" ]]; then
+            break
+          fi
+        
+          echo "Attempt $i: could not parse latest version, retrying..."
+          sleep $((i * 2))
+        done
         
         if [[ -z "$LATEST_VERSION" ]]; then
           echo "Error: Could not determine latest version"
+          echo "Debug: first 2000 chars of page:"
+          printf '%s' "$RELEASE_PAGE" | head -c 2000
           exit 1
         fi
         
