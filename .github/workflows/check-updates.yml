@@ -24,92 +24,111 @@ jobs:
       run: |
         set -euo pipefail
 
-        fetch_release_page() {
+        # --- Robust fetch helper (used for all HTTP calls) ---
+        fetch() {
+          local url="$1"
           curl -sSfL \
-            --retry 5 \
-            --retry-delay 2 \
-            --retry-max-time 60 \
-            --max-time 30 \
-            "https://inkscape.org/release/"
+            -4 \
+            -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" \
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+            -H "Accept-Language: en-US,en;q=0.9" \
+            --retry 10 \
+            --retry-delay 5 \
+            --retry-max-time 300 \
+            --connect-timeout 45 \
+            --max-time 120 \
+            --retry-all-errors \
+            "$url" 2>/dev/null || true
         }
-        
-        echo "Fetching release page..."
+
+        # === Determine latest stable version ===
+        echo "=== Determining latest stable version ==="
         LATEST_VERSION=""
-        RELEASE_PAGE=""
-        
-        for i in {1..3}; do
-          RELEASE_PAGE="$(fetch_release_page)" || true
-          LATEST_VERSION="$(grep -oP 'inkscape-\K[0-9]+\.[0-9]+(\.[0-9]+)?' <<<"$RELEASE_PAGE" | head -1 || true)"
-        
-          if [[ -n "$LATEST_VERSION" ]]; then
-            break
-          fi
-        
-          echo "Attempt $i: could not parse latest version, retrying..."
-          sleep $((i * 2))
-        done
-        
+        VERSION_SOURCE=""
+
+        # Method 1: GitLab API (fast, reliable from GHA)
+        echo "Trying GitLab API..."
+        TAGS_JSON="$(fetch "https://gitlab.com/api/v4/projects/3472737/repository/tags?per_page=30")"
+        LATEST_VERSION="$(echo "$TAGS_JSON" | grep -oP '"name":\s*"INKSCAPE_\K[0-9]+_[0-9]+(?:_[0-9]+)?' | head -1 | tr '_' '.' || true)"
+
+        if [[ -n "$LATEST_VERSION" ]]; then
+          VERSION_SOURCE="GitLab API"
+          echo "Found via GitLab API: $LATEST_VERSION"
+        else
+          # Method 2: inkscape.org release page (fallback)
+          echo "GitLab API failed, trying inkscape.org/release/..."
+          for i in {1..5}; do
+            RELEASE_PAGE="$(fetch "https://inkscape.org/release/")"
+            LATEST_VERSION="$(grep -oP 'inkscape-\K[0-9]+\.[0-9]+(\.[0-9]+)?' <<<"$RELEASE_PAGE" | head -1 || true)"
+            if [[ -n "$LATEST_VERSION" ]]; then
+              VERSION_SOURCE="inkscape.org"
+              echo "Found via inkscape.org: $LATEST_VERSION"
+              break
+            fi
+            echo "Attempt $i: could not parse version, retrying..."
+            sleep $((i * 3))
+          done
+        fi
+
         if [[ -z "$LATEST_VERSION" ]]; then
-          echo "Error: Could not determine latest version"
-          echo "Debug: first 2000 chars of page:"
-          printf '%s' "$RELEASE_PAGE" | head -c 2000
+          echo "Error: Could not determine latest version from any source"
+          echo "Debug: GitLab tags excerpt:"
+          echo "$TAGS_JSON" | head -c 1000
           exit 1
         fi
-        
-        echo "Latest version detected: $LATEST_VERSION"
+
+        echo "Latest version detected: $LATEST_VERSION (source: $VERSION_SOURCE)"
         echo "latest_version=$LATEST_VERSION" >> "$GITHUB_OUTPUT"
-        
-        # Method A: Search the specific release page (scrapes the download button)
-        echo "Checking release specific page..."
-        DL_PAGE=$(curl -sL "https://inkscape.org/release/inkscape-${LATEST_VERSION}/gnulinux/appimage/dl/")
-        
-        APPIMAGE_URL=$(echo "$DL_PAGE" | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/[^"]+\.AppImage' | head -1 || true)
-        
-        # Method B: Search for hrefs that look like gallery items (common in redirects)
+
+        # === Find AppImage URL ===
+        echo "=== Finding AppImage URL for $LATEST_VERSION ==="
+        APPIMAGE_URL=""
+
+        # Method A: release-specific download page
+        echo "Method A: scraping release download page..."
+        DL_PAGE="$(fetch "https://inkscape.org/release/inkscape-${LATEST_VERSION}/gnulinux/appimage/dl/")"
+        APPIMAGE_URL="$(echo "$DL_PAGE" | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/[^"]+\.AppImage' | head -1 || true)"
+
+        # Method B: href parsing from same page
         if [[ -z "$APPIMAGE_URL" ]]; then
-          echo "Method A failed. Trying Method B (href parsing)..."
-          PARTIAL_URL=$(echo "$DL_PAGE" | grep -oP 'href="/gallery/item/[0-9]+/[^"]+\.AppImage"' | head -1 || true)
+          echo "Method B: href parsing..."
+          PARTIAL_URL="$(echo "$DL_PAGE" | grep -oP 'href="/gallery/item/[0-9]+/[^"]+\.AppImage"' | head -1 || true)"
           if [[ -n "$PARTIAL_URL" ]]; then
-             APPIMAGE_URL="https://inkscape.org$(echo "$PARTIAL_URL" | sed 's/href="//' | sed 's/"$//')"
+            APPIMAGE_URL="https://inkscape.org$(echo "$PARTIAL_URL" | sed 's/href="//' | sed 's/"$//')"
           fi
         fi
 
-        # Method C: Direct Gallery Search (fallback)
+        # Method C: direct gallery search
         if [[ -z "$APPIMAGE_URL" ]]; then
-          echo "Method B failed. Searching Inkscape Gallery directly..."
-          # Query the gallery for "AppImage" and the version number
-          GALLERY_SEARCH=$(curl -sL "https://inkscape.org/gallery/?q=AppImage+${LATEST_VERSION}")
-          
-          # Regex to find the standard AppImage link from gallery results
-          APPIMAGE_URL=$(echo "$GALLERY_SEARCH" | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/Inkscape[^"]*x86_64\.AppImage' | head -1 || true)
+          echo "Method C: gallery search..."
+          GALLERY_HTML="$(fetch "https://inkscape.org/gallery/?q=AppImage+${LATEST_VERSION}")"
+          APPIMAGE_URL="$(echo "$GALLERY_HTML" | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/Inkscape[^"]*x86_64\.AppImage' | head -1 || true)"
         fi
-        
-        # Validation
+
         if [[ -z "$APPIMAGE_URL" ]]; then
-          echo "Error: Could not find AppImage download URL after all attempts."
-          echo "Debug: Failed to find URL for version $LATEST_VERSION"
+          echo "Error: Could not find AppImage URL after all methods"
           exit 1
         fi
-        
+
         echo "AppImage URL found: $APPIMAGE_URL"
         echo "appimage_url=$APPIMAGE_URL" >> "$GITHUB_OUTPUT"
-        
-        # 3. Check AUR version
+
+        # === Check AUR version ===
         echo "Getting current version from AUR..."
-        TMPDIR=$(mktemp -d)
+        TMPDIR="$(mktemp -d)"
         CURRENT_VERSION="none"
         if git clone --depth 1 "https://aur.archlinux.org/inkscape-bin.git" "$TMPDIR"; then
           if [[ -f "$TMPDIR/PKGBUILD" ]]; then
-            CURRENT_VERSION=$(grep '^pkgver=' "$TMPDIR/PKGBUILD" | head -1 | cut -d= -f2 | tr -d "'\" " || true)
+            CURRENT_VERSION="$(grep '^pkgver=' "$TMPDIR/PKGBUILD" | head -1 | cut -d= -f2 | tr -d "'\" " || true)"
           fi
         else
           echo "Warning: Failed to clone AUR repo; assuming no current version."
         fi
         rm -rf "$TMPDIR"
-        
+
         echo "Current version in AUR: $CURRENT_VERSION"
         echo "current_version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
-        
+
         if [[ "$LATEST_VERSION" != "$CURRENT_VERSION" ]] || [[ "${{ inputs.force_update }}" == "true" ]]; then
           echo "Update required."
           echo "update_needed=true" >> "$GITHUB_OUTPUT"
