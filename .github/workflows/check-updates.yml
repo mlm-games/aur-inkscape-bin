@@ -41,12 +41,23 @@ jobs:
             "$url" 2>/dev/null || true
         }
 
+        head_check() {
+          local url="$1"
+          curl -sSfLI -o /dev/null -w "%{http_code}" \
+            -4 \
+            -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" \
+            --connect-timeout 15 \
+            --max-time 30 \
+            "$url" 2>/dev/null || echo "000"
+        }
+
         # === Determine latest stable version ===
         echo "=== Determining latest stable version ==="
         LATEST_VERSION=""
         VERSION_SOURCE=""
+        TAG_NAME=""
 
-        # Method 1: GitLab API (fast, reliable from GHA)
+        # GitLab API (reliable from GHA)
         echo "Trying GitLab API..."
         TAGS_JSON="$(fetch "https://gitlab.com/api/v4/projects/3472737/repository/tags?per_page=30")"
         LATEST_VERSION="$(echo "$TAGS_JSON" | grep -oP '"name":\s*"INKSCAPE_\K[0-9]+_[0-9]+(?:_[0-9]+)?' | head -1 | tr '_' '.' || true)"
@@ -54,9 +65,11 @@ jobs:
         if [[ -n "$LATEST_VERSION" ]]; then
           VERSION_SOURCE="GitLab API"
           echo "Found via GitLab API: $LATEST_VERSION"
+          # Build tag name (e.g. INKSCAPE_1_4_4)
+          TAG_NAME="INKSCAPE_$(echo "$LATEST_VERSION" | tr '.' '_')"
         else
-          # Method 2: inkscape.org release page (fallback)
-          echo "GitLab API failed, trying inkscape.org/release/..."
+          # Fallback: inkscape.org release page (may 403, but try anyway)
+          echo "GitLab API failed, trying inkscape.org..."
           for i in {1..5}; do
             RELEASE_PAGE="$(fetch "https://inkscape.org/release/")"
             LATEST_VERSION="$(grep -oP 'inkscape-\K[0-9]+\.[0-9]+(\.[0-9]+)?' <<<"$RELEASE_PAGE" | head -1 || true)"
@@ -65,52 +78,60 @@ jobs:
               echo "Found via inkscape.org: $LATEST_VERSION"
               break
             fi
-            echo "Attempt $i: could not parse version, retrying..."
             sleep $((i * 3))
           done
         fi
 
         if [[ -z "$LATEST_VERSION" ]]; then
           echo "Error: Could not determine latest version from any source"
-          echo "Debug: GitLab tags excerpt:"
-          echo "$TAGS_JSON" | head -c 1000
           exit 1
         fi
 
         echo "Latest version detected: $LATEST_VERSION (source: $VERSION_SOURCE)"
         echo "latest_version=$LATEST_VERSION" >> "$GITHUB_OUTPUT"
 
-        # === Find AppImage URL ===
+        # === Find AppImage URL (via media.inkscape.org, no scraping of inkscape.org) ===
         echo "=== Finding AppImage URL for $LATEST_VERSION ==="
         APPIMAGE_URL=""
 
-        # Method A: release-specific download page
-        echo "Method A: scraping release download page..."
-        DL_PAGE="$(fetch "https://inkscape.org/release/inkscape-${LATEST_VERSION}/gnulinux/appimage/dl/")"
-        APPIMAGE_URL="$(echo "$DL_PAGE" | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/[^"]+\.AppImage' | head -1 || true)"
+        # Get commit hash from GitLab tag (needed for legacy URL pattern)
+        COMMIT_HASH=""
+        if [[ -n "$TAG_NAME" ]]; then
+          echo "Looking up tag $TAG_NAME on GitLab..."
+          TAG_DATA="$(fetch "https://gitlab.com/api/v4/projects/3472737/repository/tags/$TAG_NAME")"
+          COMMIT_HASH="$(echo "$TAG_DATA" | grep -oP '"short_id":"\K[0-9a-f]{7,}' | head -1 || true)"
+          echo "Commit hash: ${COMMIT_HASH:-none}"
+        fi
 
-        # Method B: href parsing from same page
-        if [[ -z "$APPIMAGE_URL" ]]; then
-          echo "Method B: href parsing..."
-          PARTIAL_URL="$(echo "$DL_PAGE" | grep -oP 'href="/gallery/item/[0-9]+/[^"]+\.AppImage"' | head -1 || true)"
-          if [[ -n "$PARTIAL_URL" ]]; then
-            APPIMAGE_URL="https://inkscape.org$(echo "$PARTIAL_URL" | sed 's/href="//' | sed 's/"$//')"
+        # Candidate URL patterns
+        CANDIDATES=()
+
+        # Pattern 1 (new convention, >= 1.4.4): Inkscape-<version>.AppImage
+        CANDIDATES+=("https://media.inkscape.org/dl/resources/file/Inkscape-${LATEST_VERSION}.AppImage")
+
+        # Pattern 2 (legacy convention, < 1.4.4): Inkscape-<hash>-x86_64.AppImage
+        if [[ -n "$COMMIT_HASH" ]]; then
+          CANDIDATES+=("https://media.inkscape.org/dl/resources/file/Inkscape-${COMMIT_HASH}-x86_64.AppImage")
+        fi
+
+        for url in "${CANDIDATES[@]}"; do
+          echo "Testing: $url"
+          HTTP_CODE="$(head_check "$url")"
+          if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "302" || "$HTTP_CODE" == "301" ]]; then
+            APPIMAGE_URL="$url"
+            echo "Found: $APPIMAGE_URL"
+            break
           fi
-        fi
-
-        # Method C: direct gallery search
-        if [[ -z "$APPIMAGE_URL" ]]; then
-          echo "Method C: gallery search..."
-          GALLERY_HTML="$(fetch "https://inkscape.org/gallery/?q=AppImage+${LATEST_VERSION}")"
-          APPIMAGE_URL="$(echo "$GALLERY_HTML" | grep -oP 'https://inkscape\.org/gallery/item/[0-9]+/Inkscape[^"]*x86_64\.AppImage' | head -1 || true)"
-        fi
+          echo "  -> HTTP $HTTP_CODE, not found"
+        done
 
         if [[ -z "$APPIMAGE_URL" ]]; then
-          echo "Error: Could not find AppImage URL after all methods"
+          echo "Error: Could not find AppImage URL for $LATEST_VERSION"
+          echo "Debug: commit_hash=$COMMIT_HASH"
           exit 1
         fi
 
-        echo "AppImage URL found: $APPIMAGE_URL"
+        echo "AppImage URL: $APPIMAGE_URL"
         echo "appimage_url=$APPIMAGE_URL" >> "$GITHUB_OUTPUT"
 
         # === Check AUR version ===
